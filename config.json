@@ -1,0 +1,52 @@
+{
+  "screen": {
+    "disc_region": {
+      "left": 955,
+      "top": 400,
+      "width": 144,
+      "height": 144
+    },
+    "disc_cx": 1026.8,
+    "disc_cy": 472.0,
+    "disc_r": 50.0
+  },
+  "cadence": {
+    "base_hold": 0.108,
+    "base_rest": 0.145,
+    "min_hold": 0.080,
+    "max_hold": 0.125,
+    "min_rest": 0.050,
+    "max_rest": 0.320,
+    "target_ratio": 0.50,
+    "kp_rest": 0.0055,
+    "kd_rest": 0.0025,
+    "kp_hold": 0.0010,
+    "invert_tension": false
+  },
+  "detection": {
+    "disc_dark_v": 75,
+    "disc_rim_dark_frac": 0.60,
+    "ring_v_min": 75,
+    "ring_s_min": 10,
+    "ring_s_max": 220,
+    "ring_h_max": 35,
+    "ring_h_min2": 160,
+    "ring_min_px": 25,
+    "check_min_px": 80,
+    "check_stable_frames": 2,
+    "disc_stable_frames": 4
+  },
+  "keys": {
+    "reel_key": "enter",
+    "catch_key": "e",
+    "catch_key_hold": 0.100,
+    "input_backend": "pydirectinput",
+    "auto_recast": false,
+    "recast_delay": 2.0
+  },
+  "safety": {
+    "max_reel_s": 120.0,
+    "reel_gone_s": 1.2,
+    "cooldown_s": 2.0
+  }
+}
