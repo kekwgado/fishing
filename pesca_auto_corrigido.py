@@ -36,9 +36,11 @@ import numpy as np
 # ----------------------------------------------------------------------------
 # CONFIGURAÇÃO — captura e cores (herdadas do detector validado)
 # ----------------------------------------------------------------------------
-REGION = {"left": 993, "top": 475, "width": 28, "height": 220}  # NÃO ALTERAR
-# Os arquivos são procurados na MESMA pasta deste script, não importa de onde você o execute.
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+from pesca_config import load_and_sync_config, GuardarDetector
+
+CONFIG = load_and_sync_config()
+REGION = CONFIG["screen"]["bar_region"]
 REF_PATH = os.path.join(BASE_DIR, "referencia.png")
 CAL_FILE = os.path.join(BASE_DIR, "calibracao.json")
 
@@ -129,19 +131,23 @@ CHECK_FRAMES = 3             # frames seguidos vendo o check para dar como concl
 SAVE_TELEMETRY = True        # grava CSV do anel interno em ./telemetria (base do caminho B)
 TELEMETRY_DIR = os.path.join(BASE_DIR, "telemetria")
 
-# Geometria medida no seu vídeo (1920x1080): disco fixo na tela
-DISC_CX, DISC_CY, DISC_R = 1026.8, 472.0, 50.0
-DISC_REGION = {"left": 955, "top": 400, "width": 144, "height": 144}
+# Geometria sincronizada com a resolução da tela
+DISC_CX = CONFIG["screen"]["disc_cx"]
+DISC_CY = CONFIG["screen"]["disc_cy"]
+DISC_R = float(CONFIG["screen"]["disc_r"])
+DISC_REGION = CONFIG["screen"]["disc_region"]
+GUARDAR_REGION = CONFIG["screen"]["guardar_region"]
+
 DISC_STABLE_FRAMES = 6       # frames seguidos com o disco para aceitar
 DISC_DARK_V = 75             # V máximo da borda escura do disco
-DISC_RIM_DARK_FRAC = 0.65    # fração da coroa que precisa ser escura (sozinha não basta: exige anel/arco/check)
-RING_V_MIN, RING_S_MIN, RING_S_MAX = 165, 35, 215   # anel interno (rosado claro)
-RING_H_MAX, RING_H_MIN2 = 25, 165
-RING_MIN_PX = 30
+DISC_RIM_DARK_FRAC = 0.60    # fração da coroa que precisa ser escura
+RING_V_MIN, RING_S_MIN, RING_S_MAX = 75, 10, 220   # anel interno (adaptado para dia/noite e sombras)
+RING_H_MAX, RING_H_MIN2 = 35, 160
+RING_MIN_PX = 25
 ARC_H = (35, 90)             # arco verde externo
-ARC_S_MIN, ARC_V_MIN = 50, 140
+ARC_S_MIN, ARC_V_MIN = 40, 80
 ARC_MIN_DEG = 15
-CHECK_MIN_PX = 100           # pixels verdes no centro = check de sucesso
+CHECK_MIN_PX = 80            # pixels verdes no centro = check de sucesso (WhatsApp Image 22.10.27)
 
 
 def _union(a, b):
@@ -151,18 +157,21 @@ def _union(a, b):
     return {"left": left, "top": top, "width": right - left, "height": bottom - top}
 
 
-# Uma única captura cobre a barra (mesmos pixels validados) e o disco; depois é fatiada.
-CAPTURE = _union(REGION, DISC_REGION)
+# Uma única captura cobre a barra, o disco e a região de guardar peixe.
+CAPTURE = _union(_union(REGION, DISC_REGION), GUARDAR_REGION)
 BAR_OFF = (REGION["left"] - CAPTURE["left"], REGION["top"] - CAPTURE["top"])
 DISC_OFF = (DISC_REGION["left"] - CAPTURE["left"], DISC_REGION["top"] - CAPTURE["top"])
+GUARDAR_OFF = (GUARDAR_REGION["left"] - CAPTURE["left"], GUARDAR_REGION["top"] - CAPTURE["top"])
 
 
 def split_capture(cap):
     bx, by = BAR_OFF
     dx, dy = DISC_OFF
+    gx, gy = GUARDAR_OFF
     bar = np.ascontiguousarray(cap[by:by + REGION["height"], bx:bx + REGION["width"]])
     disc = np.ascontiguousarray(cap[dy:dy + DISC_REGION["height"], dx:dx + DISC_REGION["width"]])
-    return bar, disc
+    guardar = np.ascontiguousarray(cap[gy:gy + GUARDAR_REGION["height"], gx:gx + GUARDAR_REGION["width"]])
+    return bar, disc, guardar
 
 
 # ----------------------------------------------------------------------------
@@ -297,7 +306,8 @@ def find_band(bgr, gray, h_ref):
 def load_reference(path=REF_PATH):
     ref = cv2.imread(path, cv2.IMREAD_COLOR)
     if ref is None:
-        sys.exit(f"[ERRO] Não consegui abrir '{path}' (pasta atual: {os.getcwd()}).")
+        print(f"[INFO] '{path}' não encontrada. Operando exclusivamente em modo Minigame Circular (Etapa 3).")
+        return None
     if ref.shape[1] != REGION["width"]:
         print(f"[AVISO] Largura da referência ({ref.shape[1]}) != região ({REGION['width']}). Ajustando.")
         ref = cv2.resize(ref, (REGION["width"], ref.shape[0]), interpolation=cv2.INTER_NEAREST)
@@ -400,22 +410,37 @@ def analyze_disc(img):
 
 
 class Tapper(threading.Thread):
-    """Ciclo de toques (igual ao seu script): hold com tecla pressionada, rest solta."""
+    """Ciclo de toques com controle dinâmico de cadência para estabilizar o anel."""
 
     def __init__(self, press, release, hold, rest):
         super().__init__(daemon=True)
         self.press, self.release, self.hold, self.rest = press, release, hold, rest
         self.active = threading.Event()
         self.quit = threading.Event()
+        self.emergency_brake = threading.Event()
         self.down = False
         self.taps = 0
+        self._lock = threading.Lock()
+
+    def update_cadence(self, hold, rest, brake=False):
+        with self._lock:
+            self.hold = hold
+            self.rest = rest
+            if brake:
+                self.emergency_brake.set()
+            else:
+                self.emergency_brake.clear()
 
     def start_taps(self):
         self.taps = 0
+        self.emergency_brake.clear()
         self.active.set()
 
     def stop_taps(self):
         self.active.clear()
+        self.emergency_brake.clear()
+        self.release()
+        self.down = False
 
     def _wait(self, dur):
         end = time.perf_counter() + dur
@@ -424,37 +449,52 @@ class Tapper(threading.Thread):
 
     def run(self):
         while not self.quit.is_set():
-            if not self.active.is_set():
-                time.sleep(0.005)
+            if not self.active.is_set() or self.emergency_brake.is_set():
+                if self.down:
+                    self.release()
+                    self.down = False
+                time.sleep(0.003)
                 continue
+            with self._lock:
+                h, r = self.hold, self.rest
             try:
                 self.press()
                 self.down = True
                 self.taps += 1
-                self._wait(self.hold)
+                self._wait(h)
             finally:
                 self.release()
                 self.down = False
-            if self.active.is_set() and not self.quit.is_set():
-                self._wait(self.rest)
+            if self.active.is_set() and not self.quit.is_set() and not self.emergency_brake.is_set():
+                self._wait(r)
 
 
 def make_input(backend):
     if backend == "pydirectinput":
         import pydirectinput
         pydirectinput.PAUSE = 0
-        return (lambda: pydirectinput.keyDown(KEY)), (lambda: pydirectinput.keyUp(KEY))
+        def press_e():
+            pydirectinput.keyDown("e")
+            time.sleep(0.100)
+            pydirectinput.keyUp("e")
+        return (lambda: pydirectinput.keyDown(KEY)), (lambda: pydirectinput.keyUp(KEY)), press_e
     import keyboard
-    return (lambda: keyboard.press(KEY)), (lambda: keyboard.release(KEY))
+    def press_e():
+        keyboard.press("e")
+        time.sleep(0.100)
+        keyboard.release("e")
+    return (lambda: keyboard.press(KEY)), (lambda: keyboard.release(KEY)), press_e
 
 
 # ----------------------------------------------------------------------------
 # CONTROLADOR (independente de mss/keyboard para poder ser testado)
 # ----------------------------------------------------------------------------
 class Bot:
-    def __init__(self, ref, clock, press, release, wait_until, log=print, tapper=None):
+    def __init__(self, ref, clock, press, release, wait_until, log=print, tapper=None, press_e=None, guardar_detector=None):
         self.ref, self.clock = ref, clock
         self.tapper = tapper
+        self.press_e = press_e
+        self.guardar_detector = guardar_detector
         self.reel_on = REEL_ENABLED and tapper is not None
         self.disc_info = None
         self.disc_hist = deque(maxlen=DISC_STABLE_FRAMES)
@@ -472,6 +512,7 @@ class Bot:
         self.v_hist = []
         self.v_fit = None
         self.last_tip_frame = self.last_post_frame = None
+        self.t_wait_guardar = 0.0
         self.state = "IDLE"
         self._to_idle()
 
@@ -494,6 +535,8 @@ class Bot:
             self.log(f"[AVISO] Falha ao soltar tecla: {e}")
 
     def bar_check(self, frame):
+        if self.ref is None:
+            return False, 0.0
         bg = self.ref["bg"]
         if not USE_BG_CHECK or bg is None:
             return True, 1.0
@@ -507,7 +550,7 @@ class Bot:
             self._release_now()
             self.log("[DESARMADO] Enter solto.")
             self._to_idle()
-        elif not value and self.state in ("WAIT_REEL", "REELING"):
+        elif not value and self.state in ("WAIT_REEL", "REELING", "WAIT_GUARDAR"):
             if self.tapper is not None:
                 self.tapper.stop_taps()
             self._release_now()
@@ -515,9 +558,16 @@ class Bot:
             self._to_idle()
 
     # ---- passo principal --------------------------------------------------
-    def step(self, frame, t_cap, disc=None):
+    def step(self, frame, t_cap, disc=None, guardar_frame=None):
         st = self.state
         self.disc_info = None
+
+        if st == "WAIT_GUARDAR":
+            self.tip = None
+            self._wait_guardar(guardar_frame, t_cap)
+            self.prev_tcap = t_cap
+            return
+
         if self.reel_on and disc is not None and st in ("IDLE", "WAIT_REEL", "REELING"):
             self.disc_info = analyze_disc(disc)
         if st in ("WAIT_REEL", "REELING"):
@@ -542,6 +592,27 @@ class Bot:
         elif st == "COOLDOWN":
             self._cooldown(frame, gray, t_cap)
         self.prev_tcap = t_cap
+
+    def _wait_guardar(self, guardar_frame, t_cap):
+        if self.guardar_detector is None or guardar_frame is None:
+            if self.press_e:
+                self.press_e()
+            self._enter_cooldown()
+            return
+
+        found, score, loc = self.guardar_detector.detect(guardar_frame)
+        elapsed = t_cap - self.t_wait_guardar
+        self.diag = f"guardar={'SIM' if found else 'aguardando'} score={score:.2f} t={elapsed:.1f}s"
+        if found:
+            self.log(f"[GUARDAR] Prompt '[E] Guardar Peixe' detectado na tela (score={score:.2f})! Pressionando E...")
+            if self.press_e:
+                self.press_e()
+            self._enter_cooldown()
+        elif elapsed >= 3.5:
+            self.log("[GUARDAR] Tempo limite aguardando prompt: pressionando 'E' por seguranca...")
+            if self.press_e:
+                self.press_e()
+            self._enter_cooldown()
 
     # ---- IDLE -------------------------------------------------------------
     def _idle(self, frame, gray, t_cap):
@@ -800,6 +871,16 @@ class Bot:
             self.reel_rows.append((t_rel, int(self.tapper.down), self.tapper.taps, i["arc_deg"],
                                    i["ring_r"], i["check_n"], i["rim_dark"]))
             self.gone_since = None
+
+            # Controle dinâmico adaptativo de cadência para manter o anel estável:
+            if i["ring_r"] is not None:
+                target_r = DISC_R * 0.50
+                err = i["ring_r"] - target_r
+                delta_rest = 0.0055 * err
+                new_rest = float(np.clip(REEL_TAP_REST + delta_rest, 0.050, 0.320))
+                new_hold = float(np.clip(REEL_TAP_HOLD - 0.0010 * err, 0.080, 0.125))
+                brake = i["ring_r"] >= (DISC_R * 0.88)
+                self.tapper.update_cadence(new_hold, new_rest, brake)
         elif self.gone_since is None:
             self.gone_since = t_cap
         if present and i["check_n"] >= CHECK_MIN_PX:
@@ -838,7 +919,12 @@ class Bot:
                 self.log(f"[TELEMETRIA] {path}")
             except Exception as e:
                 self.log(f"[AVISO] Não consegui salvar a telemetria: {e}")
-        self._enter_cooldown()
+        if "SUCESSO" in reason:
+            self.state = "WAIT_GUARDAR"
+            self.t_wait_guardar = self.clock()
+            self.log("[FIM PUXAR] Sucesso! Aguardando o prompt '[E] Guardar Peixe' surgir na tela...")
+        else:
+            self._enter_cooldown()
 
     # ---- COOLDOWN ---------------------------------------------------------
     def _enter_cooldown(self):
@@ -935,7 +1021,7 @@ def run_disc_only():
     with mss.mss() as sct:
         while not stop.is_set():
             cap = np.array(sct.grab(CAPTURE))[:, :, :3]
-            _, disc = split_capture(cap)
+            _, disc, _ = split_capture(cap)
             t = time.perf_counter()
             info = analyze_disc(disc)
             n_fps += 1
@@ -965,10 +1051,14 @@ def main():
         pass
 
     ref = load_reference()
-    press, release = make_input(INPUT_BACKEND)
+    press, release, press_e = make_input(INPUT_BACKEND)
     tapper = Tapper(press, release, REEL_TAP_HOLD, REEL_TAP_REST)
     tapper.start()
-    bot = Bot(ref, time.perf_counter, press=press, release=release, wait_until=spin_wait, tapper=tapper)
+    guardar_detector = GuardarDetector(CONFIG)
+    bot = Bot(ref, time.perf_counter, press=press, release=release, wait_until=spin_wait, tapper=tapper, press_e=press_e, guardar_detector=guardar_detector)
+    if ref is None:
+        bot.state = "WAIT_REEL"
+        print("[MODO] 'referencia.png' ausente: operando diretamente no Minigame Circular.")
 
     stop = threading.Event()
     keyboard.add_hotkey("f6", stop.set)
@@ -988,21 +1078,21 @@ def main():
             while not stop.is_set():
                 cap = np.array(sct.grab(CAPTURE))[:, :, :3]
                 t_cap = time.perf_counter()
-                frame, disc = split_capture(cap)
-                bot.step(frame, t_cap, disc)
+                frame, disc, guardar = split_capture(cap)
+                bot.step(frame, t_cap, disc, guardar)
 
                 n_fps += 1
                 if t_cap - t_fps >= 1.0:
                     fps, n_fps, t_fps = n_fps / (t_cap - t_fps), 0, t_cap
 
-                if bot.state in ("IDLE", "WAIT_REEL") and t_cap - last_diag >= 1.0:
+                if bot.state in ("IDLE", "WAIT_REEL", "WAIT_GUARDAR") and t_cap - last_diag >= 1.0:
                     print(f"[{bot.state}{'' if bot.armed else ' - DESARMADO'}] {bot.diag} | fps={fps:.0f}")
                     last_diag = t_cap
 
                 # durante a subida do minigame 1 NÃO desenha nada: o loop fica o mais rápido possível
                 interval = 0.25 if bot.state == "REELING" else PREVIEW_INTERVAL
                 if SHOW_PREVIEW and bot.state != "HOLDING" and t_cap - last_prev >= interval:
-                    if bot.state in ("WAIT_REEL", "REELING"):
+                    if bot.state in ("WAIT_REEL", "REELING", "WAIT_GUARDAR"):
                         img = render_disc(disc, bot.disc_info, bot.state, [bot.diag[:44]], fps, bot.armed)
                     else:
                         img = render(bot, frame, fps)
